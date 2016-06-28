@@ -1,0 +1,82 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import ipaddress
+import math
+from pprint import pprint
+
+EXTERNAL_NETS = ["212.201.68.12", "212.201.68.0/27"]
+INTERNAL_NETS = ["192.168.136.0/24"]
+PORTRANGE = range(1024, 65536)
+
+def get_net_hosts(net, reserved=0):
+	if net.prefixlen == 32:
+		net_hosts = list(net)
+	else:
+		net_hosts = list(net.hosts())[reserved:]
+
+	return net_hosts
+
+def main():
+	# check for broken ipaddress backport
+	if ipaddress.ip_network("123.123.123.0/24") == ipaddress.IPv6Network(u'3132:332e:3132:332e:3132:332e:302f:3234/128'):
+		raise Exception("Broken ipaddress backport detected, can't continue.")
+
+	# get internal ips
+	internal_ips = []
+	for net in INTERNAL_NETS:
+		net = ipaddress.IPv4Network(net)
+		for internal_ip in get_net_hosts(net, reserved=1):  # first address reserved for router
+			if not internal_ip in internal_ips:
+				internal_ips.append(internal_ip)
+	num_internal_ips = len(internal_ips)
+
+	# get external ips
+	external_ips = []
+	for net in EXTERNAL_NETS:
+		net = ipaddress.IPv4Network(net)
+		for external_ip in get_net_hosts(net):
+			if not external_ip in external_ips:
+				external_ips.append(external_ip)
+	num_external_ips = len(external_ips)
+
+	print("# %d internal ips, %d external ips" % (num_internal_ips, num_external_ips))
+
+	# distribute internal ips over external ips
+	ints_per_ext = int(num_internal_ips / num_external_ips)
+	ints_per_ext_rem = num_internal_ips % num_external_ips
+
+	print("# %d internal ips per external ip + %d remaining" % (ints_per_ext, ints_per_ext_rem))
+
+	# calculate mappings for internal ips to external ips
+	mappings = {}
+	for external_ip in external_ips:
+		mappings[external_ip] = []
+		for i in range(0, ints_per_ext):
+			mappings[external_ip].append(internal_ips.pop(0))
+
+		if ints_per_ext_rem:
+			mappings[external_ip].append(internal_ips.pop(0))
+			ints_per_ext_rem -= 1
+
+	# define rules
+	for external_ip, internal_ips in mappings.items():
+		ports_per_ip = int(len(PORTRANGE) / len(internal_ips))
+
+		print("")
+		print("# %d internal ips mapped to %s (%d ports per ip)" % (len(internal_ips), external_ip, ports_per_ip))
+
+		next_start_port = PORTRANGE[0]
+		for internal_ip in internal_ips:
+			start_port = next_start_port
+			next_start_port = start_port + ports_per_ip
+			end_port = next_start_port - 1
+
+			assert start_port >= PORTRANGE[0]
+			assert end_port <= PORTRANGE[-1]
+
+			print("iptables -t nat -A POSTROUTING -p tcp -o eth0 -j SNAT --source %s --to-source %s:%d-%d" % (internal_ip, external_ip, start_port, end_port))
+
+
+if __name__ == '__main__':
+	main()
