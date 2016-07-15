@@ -1,82 +1,246 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import ipaddress
+import argparse
+import logging
 import math
-from pprint import pprint
+import sys
 
-EXTERNAL_NETS = ["212.201.68.12", "212.201.68.0/27"]
-INTERNAL_NETS = ["192.168.136.0/24"]
-PORTRANGE = range(1024, 65536)
+import ipaddress
 
-def get_net_hosts(net, reserved=0):
-	if net.prefixlen == 32:
-		net_hosts = list(net)
-	else:
-		net_hosts = list(net.hosts())[reserved:]
 
-	return net_hosts
+class ArgParsers(object):
+	"""
+	Parsers used for arguments within argparse
+	"""
+
+	@classmethod
+	def rangecheck(cls, min_val, max_val):
+		"""
+		Range check for integer
+
+		:param min_val: min allowed value
+		:type min_val: integer
+		:param max_val: max allowed value
+		:type max_val: integer
+		:return: method
+		"""
+		def port(portstr):
+			assert isinstance(portstr, str)
+			portnum = int(portstr)
+			assert portnum >= min_val
+			assert portnum <= max_val
+			return portnum
+
+		return port
+
+	@classmethod
+	def netlist(cls, netlist_str):
+		"""
+		Netlist parser
+
+		:param netlist_str: string with whitepsace separated network adresses
+		:type netlist_str: string
+		:return: list of ipaddress.IPv4Network
+		"""
+		assert isinstance(netlist_str, str)
+		netlist_list = netlist_str.split()
+		for i in range(0, len(netlist_list)):
+			assert isinstance(netlist_list[i], str)
+			net = netlist_list[i].strip()
+			if sys.version_info.major == 2:
+				# noinspection PyUnresolvedReferences
+				net = unicode(net)
+			netlist_list[i] = ipaddress.ip_network(net)
+			assert isinstance(netlist_list[i], ipaddress.IPv4Network)
+			netlist_list[i] = list(netlist_list[i])
+		return netlist_list
+
+
+class PnatCalc(object):
+	def __init__(self, internal_networks, external_networks, min_port, max_port):
+		assert min_port <= max_port, "lower portrange limit has to be smaller or equal to upper limit"
+
+		self.min_port = min_port
+		self.max_port = max_port
+
+		self.internal_ips = self.get_ips_from_netlist(internal_networks)
+		self.external_ips = self.get_ips_from_netlist(external_networks)
+		log.info("Mapping %d internal IPs to %d external IPs", len(self.internal_ips), len(self.external_ips))
+
+		self.ports_per_ip = self.get_max_ports_per_ip(len(self.internal_ips), len(self.external_ips), self.min_port, self.max_port)
+
+		self.iptables = 'iptables'
+		self.chain = 'PNATCALC'
+
+	def set_chain(self, chain):
+		log.info("Using '%s' as base for chain names", chain)
+		self.chain = chain
+
+	def set_iptables(self, iptables):
+		log.info("Using '%s' as iptables binary", iptables)
+		self.iptables = iptables
+
+	@classmethod
+	def get_max_ports_per_ip(cls, num_internal_ips, num_external_ips, min_port, max_port):
+		"""
+		Calculate number of maximum external ports per internal ip address.
+
+		:param num_internal_ips: number of internal ip addresses
+		:type num_internal_ips: int
+		:param num_external_ips: number of external ip addresses
+		:type num_external_ips: int
+		:param min_port: lower limit of portrange
+		:type min_port: int
+		:param max_port: upper limit of portrange
+		:type max_port: int
+		:return: int
+		"""
+		ints_per_ext = int(math.ceil(num_internal_ips / num_external_ips))
+		max_ports_per_ip = int((max_port - min_port + 1) / ints_per_ext)
+		log.info("Calculated %d external ports per internal IP address", max_ports_per_ip)
+		return max_ports_per_ip
+
+	def set_ports_per_ip(self, ports_per_ip):
+		max_ports_per_ip = self.get_max_ports_per_ip(len(self.internal_ips), len(self.external_ips), self.min_port, self.max_port)
+		assert ports_per_ip <= max_ports_per_ip, "Not enough external ip addresses for specified combination of internal ip addresses and external portrange"
+		self.ports_per_ip = ports_per_ip
+
+	@classmethod
+	def get_ips_from_netlist(cls, netlist):
+		"""
+		Convert list of IPV4Network to list of IPv4Address,
+		ignoring duplicate addresses.
+
+		:param netlist: list of ipv4 networks
+		:type netlist: list of ipaddress.IPv4Network
+		:return: list of ipaddress.IPv4Address
+		"""
+		ips = []
+		for net in netlist:
+			for ip in net:
+				if ip not in ips:
+					ips.append(ip)
+		return ips
+
+	def generate_rules(self):
+		rules = []
+
+		tmp_internal_ips = self.internal_ips[:]
+		for external_ip in self.external_ips:
+			log.info("Generating rules for external IP %s (chain: %s_%s)", external_ip, self.chain, external_ip)
+
+			for parm in ['-N', '-F']:
+				rule = "{iptables} -t nat {parm} {chain}_{external_ip}".format(iptables=self.iptables, chain=self.chain, parm=parm, external_ip=external_ip)
+				log.debug("Rule: %s", rule)
+				rules.append(rule)
+
+			next_start_port = self.min_port
+
+			internal_ips_in_chain = []
+
+			counter = 0
+			for _ in range(0, int((self.max_port - self.min_port + 1) / self.ports_per_ip)):
+				if not tmp_internal_ips:
+					break
+
+				counter += 1
+
+				internal_ip = tmp_internal_ips.pop(0)
+				internal_ips_in_chain.append(internal_ip)
+
+				start_port = next_start_port
+				next_start_port = start_port + self.ports_per_ip
+				end_port = next_start_port - 1
+
+				assert start_port >= self.min_port, "start port lower than portrange allows"
+				assert end_port <= self.max_port, "end port higher than portrange allows"
+
+				for protocol in ['tcp', 'udp']:
+					rule = "{iptables} -t nat -A {chain}_{external_ip} --source {internal_ip} -p {protocol} -j SNAT --to-source {external_ip}:{start_port:d}-{end_port:d}".format(
+						iptables=self.iptables, chain=self.chain, internal_ip=internal_ip, external_ip=external_ip, start_port=start_port, end_port=end_port, protocol=protocol)
+					log.debug("Rule: %s", rule)
+					rules.append(rule)
+
+			log.info("%d internal IPs on %s", counter, external_ip)
+
+			# default rule in chain (for other protocols than tcp and udp)
+			rule = "{iptables} -t nat -A {chain}_{external_ip} -j SNAT --to-source {external_ip}".format(
+				iptables=self.iptables, chain=self.chain, external_ip=external_ip)
+			log.debug("Rule: %s", rule)
+			rules.append(rule)
+
+			# add jump rules
+			rules.extend(self.generate_jump_rules(external_ip, internal_ips_in_chain))
+
+		assert len(tmp_internal_ips) == 0, "internal adresses remaining in temporary pool, this should never happen"
+
+		return rules
+
+	def generate_jump_rules(self, external_ip, internal_ips_in_chain):
+		"""
+		This method generates rules for jumping into the pnatcalc chain
+		for the specified external ip address.
+
+		It tries to summarize ip address ranges (to be used with the
+		iprange iptables module) to lower the number of required rules.
+
+		:param external_ip: external ip address
+		:type external_ip: ipaddress.IPv4Address
+		:param internal_ips_in_chain: list of internal ipaddresses mapped to specified external ip
+		:type internal_ips_in_chain: list of ipaddress.IPv4Address
+		:return: list of iptables rules
+		"""
+		rules = []
+
+		internal_ips_in_chain.sort()
+		while internal_ips_in_chain:
+			range_start = internal_ips_in_chain.pop(0)
+			range_end = range_start
+
+			while internal_ips_in_chain and (internal_ips_in_chain[0] - 1) == range_end:
+				range_end = internal_ips_in_chain.pop(0)
+
+			if range_start == range_end:
+				net = "--source %s" % (range_start)
+			else:
+				net = "-m iprange --src-range %s-%s" % (range_start, range_end)
+
+			rule = "{iptables} -t nat -A {chain} {net} -j {chain}_{external_ip}".format(iptables=self.iptables, chain=self.chain, net=net, external_ip=external_ip)
+			log.debug("Rule: %s", rule)
+			rules.append(rule)
+
+		return rules
+
 
 def main():
-	# check for broken ipaddress backport
-	if ipaddress.ip_network("123.123.123.0/24") == ipaddress.IPv6Network(u'3132:332e:3132:332e:3132:332e:302f:3234/128'):
-		raise Exception("Broken ipaddress backport detected, can't continue.")
+	# parse cli parameters and load config
+	argp = argparse.ArgumentParser()
+	argp.add_argument('-c', '--chain', help='chain name', default='PNATCALC')
+	argp.add_argument('-b', '--iptables', help='iptables path or binary name', default='iptables')
+	argp.add_argument('-i', '--internal', help='whitespace separated list of internal networks/adresses (e.g. "192.168.100.0/24 192.168.101.128/25")', required=True, type=ArgParsers.netlist)
+	argp.add_argument('-e', '--external', help='whitespace separated list of external networks/adresses (e.g. "198.51.100.0/24 203.0.113.1")', required=True, type=ArgParsers.netlist)
+	argp.add_argument('-m', '--min-port', help='minimum source port (between 1024 and 65535, default: 1024)', default=1024, type=ArgParsers.rangecheck(1024, 65535))
+	argp.add_argument('-M', '--max-port', help='maximum source port (between 1024 and 65535, default: 65535)', default=65535, type=ArgParsers.rangecheck(1024, 65535))
+	argp.add_argument('-p', '--ports-per-ip', help='number of ports per internal ip address (between 1 and 64512, default: auto)', type=ArgParsers.rangecheck(1, 64512))
+	args = argp.parse_args()
 
-	# get internal ips
-	internal_ips = []
-	for net in INTERNAL_NETS:
-		net = ipaddress.IPv4Network(net)
-		for internal_ip in get_net_hosts(net, reserved=1):  # first address reserved for router
-			if not internal_ip in internal_ips:
-				internal_ips.append(internal_ip)
-	num_internal_ips = len(internal_ips)
+	# generate rules
+	pnatcalc = PnatCalc(args.internal, args.external, args.min_port, args.max_port)
+	pnatcalc.set_iptables(args.iptables)
+	pnatcalc.set_chain(args.chain)
 
-	# get external ips
-	external_ips = []
-	for net in EXTERNAL_NETS:
-		net = ipaddress.IPv4Network(net)
-		for external_ip in get_net_hosts(net):
-			if not external_ip in external_ips:
-				external_ips.append(external_ip)
-	num_external_ips = len(external_ips)
+	if args.ports_per_ip:
+		pnatcalc.set_ports_per_ip(args.ports_per_ip)
 
-	print("# %d internal ips, %d external ips" % (num_internal_ips, num_external_ips))
+	rules = pnatcalc.generate_rules()
 
-	# distribute internal ips over external ips
-	ints_per_ext = int(num_internal_ips / num_external_ips)
-	ints_per_ext_rem = num_internal_ips % num_external_ips
-
-	print("# %d internal ips per external ip + %d remaining" % (ints_per_ext, ints_per_ext_rem))
-
-	# calculate mappings for internal ips to external ips
-	mappings = {}
-	for external_ip in external_ips:
-		mappings[external_ip] = []
-		for i in range(0, ints_per_ext):
-			mappings[external_ip].append(internal_ips.pop(0))
-
-		if ints_per_ext_rem:
-			mappings[external_ip].append(internal_ips.pop(0))
-			ints_per_ext_rem -= 1
-
-	# define rules
-	for external_ip, internal_ips in mappings.items():
-		ports_per_ip = int(len(PORTRANGE) / len(internal_ips))
-
-		print("")
-		print("# %d internal ips mapped to %s (%d ports per ip)" % (len(internal_ips), external_ip, ports_per_ip))
-
-		next_start_port = PORTRANGE[0]
-		for internal_ip in internal_ips:
-			start_port = next_start_port
-			next_start_port = start_port + ports_per_ip
-			end_port = next_start_port - 1
-
-			assert start_port >= PORTRANGE[0]
-			assert end_port <= PORTRANGE[-1]
-
-			print("iptables -t nat -A POSTROUTING -p tcp -o eth0 -j SNAT --source %s --to-source %s:%d-%d" % (internal_ip, external_ip, start_port, end_port))
+	# print rules
+	print("\n".join(rules))
 
 
 if __name__ == '__main__':
+	logging.basicConfig()
+	log = logging.getLogger('pnatcalc')
+	log.setLevel(logging.INFO)
 	main()
