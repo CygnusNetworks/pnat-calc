@@ -123,7 +123,40 @@ class PnatCalc(object):
 					ips.append(ip)
 		return ips
 
-	def generate_rules(self):
+	def generate_nftables_map(self, tablename, chainname):
+		MAP_TMPL = """table ip %s {
+	chain %s {
+		snat to ip saddr map { %s };
+	}
+}"""
+		entries = list()
+		tmp_internal_ips = self.internal_ips[:]
+		for external_ip in self.external_ips:
+			next_start_port = self.min_port
+
+			internal_ips_in_chain = []
+
+			counter = 0
+			for _ in range(0, int((self.max_port - self.min_port + 1) / self.ports_per_ip)):
+				if not tmp_internal_ips:
+					break
+
+				counter += 1
+
+				internal_ip = tmp_internal_ips.pop(0)
+				internal_ips_in_chain.append(internal_ip)
+
+				start_port = next_start_port
+				next_start_port = start_port + self.ports_per_ip
+				end_port = next_start_port - 1
+
+				assert start_port >= self.min_port, "start port lower than portrange allows"
+				assert end_port <= self.max_port, "end port higher than portrange allows"
+
+				entries.append("%s : %s . %i-%i" % (internal_ip, external_ip, start_port, end_port))
+		return MAP_TMPL % (tablename, chainname, ",\n\t\t\t".join(entries))
+
+	def generate_iptables_rules(self):
 		rules = []
 
 		tmp_internal_ips = self.internal_ips[:]
@@ -171,13 +204,13 @@ class PnatCalc(object):
 			rules.append(rule)
 
 			# add jump rules
-			rules.extend(self.generate_jump_rules(external_ip, internal_ips_in_chain))
+			rules.extend(self.generate_iptables_jump_rules(external_ip, internal_ips_in_chain))
 
 		assert len(tmp_internal_ips) == 0, "internal adresses remaining in temporary pool, this should never happen"
 
 		return rules
 
-	def generate_jump_rules(self, external_ip, internal_ips_in_chain):
+	def generate_iptables_jump_rules(self, external_ip, internal_ips_in_chain):
 		"""
 		This method generates rules for jumping into the pnatcalc chain
 		for the specified external ip address.
@@ -216,28 +249,31 @@ class PnatCalc(object):
 def main():
 	# parse cli parameters and load config
 	argp = argparse.ArgumentParser()
-	argp.add_argument('-c', '--chain', help='chain name', default='PNATCALC')
-	argp.add_argument('-b', '--iptables', help='iptables path or binary name', default='iptables')
+	argp.add_argument('-c', '--chain', help='iptables/nftables chain name', default='PNATCALC')
+	argp.add_argument('--mode', help='mode for running (iptables or nftables)', choices=['iptables', 'nftables'], default='iptables')
 	argp.add_argument('-i', '--internal', help='whitespace separated list of internal networks/adresses (e.g. "192.168.100.0/24 192.168.101.128/25")', required=True, type=ArgParsers.netlist)
 	argp.add_argument('-e', '--external', help='whitespace separated list of external networks/adresses (e.g. "198.51.100.0/24 203.0.113.1")', required=True, type=ArgParsers.netlist)
 	argp.add_argument('-m', '--min-port', help='minimum source port (between 1024 and 65535, default: 1024)', default=1024, type=ArgParsers.rangecheck(1024, 65535))
 	argp.add_argument('-M', '--max-port', help='maximum source port (between 1024 and 65535, default: 65535)', default=65535, type=ArgParsers.rangecheck(1024, 65535))
 	argp.add_argument('-p', '--ports-per-ip', help='number of ports per internal ip address (between 1 and 64512, default: auto)', type=ArgParsers.rangecheck(1, 64512))
+	argp.add_argument('-b', '--iptables', help='iptables path or binary name', default='iptables')
+	argp.add_argument('-t', '--tablename', help='nftables tables name', default='nat')
 	args = argp.parse_args()
 
 	# generate rules
 	pnatcalc = PnatCalc(args.internal, args.external, args.min_port, args.max_port)
-	pnatcalc.set_iptables(args.iptables)
-	pnatcalc.set_chain(args.chain)
 
 	if args.ports_per_ip:
 		pnatcalc.set_ports_per_ip(args.ports_per_ip)
 
-	rules = pnatcalc.generate_rules()
-
-	# print rules
-	print("\n".join(rules))
-
+	if args.mode == 'iptables':
+		pnatcalc.set_iptables(args.iptables)
+		pnatcalc.set_chain(args.chain)
+		rules = pnatcalc.generate_iptables_rules()
+		print("\n".join(rules))
+	if args.mode == 'nftables':
+		nft_map = pnatcalc.generate_nftables_map(args.tablename, args.chain)
+		print(nft_map)
 
 if __name__ == '__main__':
 	logging.basicConfig()
